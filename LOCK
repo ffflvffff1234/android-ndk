@@ -1,0 +1,6 @@
+# 此文件存在后，workflow 转为每周巡检模式；删除它可强制立即重新全量同步
+ndk_version=30.0.16248370
+ndk_short=r30
+synced_at=2026-11-27T15:48:38Z
+release_tag=r30-30.0.16248370-20261127
+platforms=linux windows darwin
