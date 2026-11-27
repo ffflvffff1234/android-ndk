@@ -1,0 +1,199 @@
+name: Fetch Latest Android NDK
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/fndk.yml'   # 改配置才触发，避免自己永久循环
+      - 'LOCK'
+  schedule:
+    - cron: '0 2 * * 1'                # 锁存在后：每周一北京时间 10:00 巡检
+  workflow_dispatch:                   # 手动：强制重跑（跳过"无更新"判断）
+
+permissions:
+  contents: write                      # 建锁文件 + 建 Release 都需要写权限
+
+concurrency:
+  group: fetch-ndk
+  cancel-in-progress: false
+
+env:
+  LOCK_FILE: LOCK
+  PLATFORMS: "linux windows darwin"
+
+jobs:
+  fetch-ndk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      # ---------- 1. 探测最新 stable 版本 ----------
+      - name: Detect latest NDK
+        id: detect
+        shell: bash
+        run: |
+          set -euo pipefail
+          XML="$(curl -fsSL https://dl.google.com/android/repository/repository2-3.xml)"
+
+          VER="$(printf '%s' "$XML" \
+            | grep -oE '<remotePackage path="ndk;[^"]+"' \
+            | grep -oE '[0-9]+\.[0-9]+\.[0-9]+(-rc[0-9]+)?(-beta[0-9]+)?' \
+            | grep -vE -- '-(rc|beta)[0-9]+$' \
+            | sort -t. -k1,1n -k2,2n -k3,3n \
+            | tail -n1)"
+          [ -n "$VER" ] || { echo "::error::未能解析最新 NDK 版本"; exit 1; }
+
+          SHORT="r${VER%%.*}"
+          DATE="$(date -u +%Y%m%d)"
+          TAG="${SHORT}-${VER}-${DATE}"     # 例：r30-30.0.16248370-20261127
+
+          {
+            echo "version=${VER}"
+            echo "short=${SHORT}"
+            echo "tag=${TAG}"
+            echo "date=${DATE}"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "latest: ${VER} (${SHORT})  tag=${TAG}"
+
+      # ---------- 2. 锁存在 → 比对已发布版本；锁不存在 → 立刻跑 ----------
+      - name: Check lock and already-published version
+        id: gate
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FORCE: ${{ github.event_name == 'workflow_dispatch' }}
+        run: |
+          set -euo pipefail
+          SHORT="${{ steps.detect.outputs.short }}"
+
+          if [ -f "$LOCK_FILE" ]; then
+            echo "锁文件存在 → 巡检模式（每周）"
+            LOCKED_VER="$(grep -E '^ndk_version=' "$LOCK_FILE" | head -n1 | cut -d= -f2 || true)"
+            if [ "$FORCE" != 'true' ] && [ "$LOCKED_VER" = "${{ steps.detect.outputs.version }}" ]; then
+              echo "无更新（锁内 ${LOCKED_VER} == 最新），跳过下载"
+              echo "skip=true"  >> "$GITHUB_OUTPUT"
+              echo "reason=no-update" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "发现新版本：${LOCKED_VER} -> ${{ steps.detect.outputs.version }}"
+          else
+            echo "锁文件不存在 → 首次立刻执行，全量拉取"
+          fi
+
+          # 该版本任何平台已发过且非强制 → 跳过（幂等）
+          PREFIX="${SHORT}-${{ steps.detect.outputs.version }}-"
+          if [ "$FORCE" != 'true' ] && gh release list --limit 50 \
+               | awk '{print $1}' | grep -q "^${PREFIX}"; then
+            echo "Release 已存在 ${PREFIX}*，跳过"
+            echo "skip=true"  >> "$GITHUB_OUTPUT"
+            echo "reason=released" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # ---------- 3. 并行下载各平台包（失败不阻断其他平台） ----------
+      - name: Download NDK packages
+        if: steps.gate.outputs.skip != 'true'
+        shell: bash
+        run: |
+          set -uo pipefail
+          mkdir -p dist
+          BASE="https://dl.google.com/android/repository"
+          SHORT="${{ steps.detect.outputs.short }}"
+          FAILED=0
+
+          for P in $PLATFORMS; do
+            (
+              if [ "$P" = darwin ]; then
+                F="android-ndk-${SHORT}-darwin.dmg"; U="${BASE}/${F}"
+              else
+                F="android-ndk-${SHORT}-${P}.zip";    U="${BASE}/${F}"
+              fi
+              echo "::group::${P}"
+              curl -fL --retry 3 --retry-delay 5 --connect-timeout 30 \
+                   --max-time 1800 -o "dist/${F}" "$U" \
+                && unzip -tq "dist/${F}" 2>/dev/null || [ "$P" = darwin ] \
+                && echo "${P} OK" || { echo "::error::${P} 下载或校验失败"; exit 1; }
+              echo "::endgroup::"
+            ) &
+          done
+          wait
+
+          for P in $PLATFORMS; do
+            if [ "$P" = darwin ]; then F="android-ndk-${SHORT}-darwin.dmg"
+            else F="android-ndk-${SHORT}-${P}.zip"; fi
+            [ -s "dist/${F}" ] || { echo "::error::缺失 ${F}"; FAILED=1; }
+          done
+          ls -lh dist/
+          exit "$FAILED"
+
+      # ---------- 4. 生成校验信息 + ABI 说明 ----------
+      - name: Checksums and notes
+        if: steps.gate.outputs.skip != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum * > SHA256SUMS.txt
+          {
+            echo "ndk_version=${{ steps.detect.outputs.version }}"
+            echo "ndk_short=${{ steps.detect.outputs.short }}"
+            echo "sync_date=${{ steps.detect.outputs.date }}"
+            echo "source=https://dl.google.com/android/repository/"
+            echo
+            echo "平台包：linux / windows / darwin 各自包含全部 NDK 支持 ABI："
+            echo "  arm64-v8a, armeabi-v7a, x86_64, x86, riscv64（版本依赖）"
+            echo "解压后 toolchains 目录见 llvm/prebuilt/<host>-x86_64/bin/"
+            echo
+            cat SHA256SUMS.txt
+          } > RELEASE_NOTES.md
+
+      # ---------- 5. 发布到正式版 Release（tag 含日期+版本） ----------
+      - name: Publish Release
+        if: steps.gate.outputs.skip != 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.detect.outputs.tag }}"
+
+          gh release create "$TAG" dist/* \
+            --title "Android NDK ${{ steps.detect.outputs.version }} (${{ steps.detect.outputs.short }}) · ${{ steps.detect.outputs.date }}" \
+            --notes-file dist/RELEASE_NOTES.md \
+            || gh release upload "$TAG" dist/* --clobber
+
+          echo "released: https://github.com/${{ github.repository }}/releases/tag/${TAG}"
+
+      # ---------- 6. 写入锁文件（首次即在此创建） ----------
+      - name: Write lock file
+        if: steps.gate.outputs.skip != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "# 此文件存在后，workflow 转为每周巡检模式；删除它可强制立即重新全量同步"
+            echo "ndk_version=${{ steps.detect.outputs.version }}"
+            echo "ndk_short=${{ steps.detect.outputs.short }}"
+            echo "synced_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "release_tag=${{ steps.detect.outputs.tag }}"
+            echo "platforms=${PLATFORMS}"
+          } > "$LOCK_FILE"
+          cat "$LOCK_FILE"
+
+      - name: Commit lock file
+        if: steps.gate.outputs.skip != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "$LOCK_FILE"
+          git diff --cached --quiet && { echo "无变化，跳过"; exit 0; }
+          git commit -m "chore: lock NDK ${{ steps.detect.outputs.version }} [skip ci]"
+          git push
