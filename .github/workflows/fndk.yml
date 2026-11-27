@@ -2,11 +2,11 @@ name: Fetch Latest Android NDK
 
 on:
   schedule:
-    - cron: '0 2 * * 1'      # 每周一北京时间 10:00 检查一次
-  workflow_dispatch:          # 也支持手动点按钮触发
+    - cron: '0 2 * * 1'
+  workflow_dispatch:
 
 permissions:
-  contents: write             # 推回仓库需要写权限
+  contents: write
 
 jobs:
   fetch-ndk:
@@ -16,7 +16,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # ---------- 1. 检测最新版（官方清单，只取 stable 通道） ----------
       - name: Detect latest NDK
         id: detect
         shell: bash
@@ -33,7 +32,7 @@ jobs:
 
           [ -n "$VER" ] || { echo "::error::未能解析最新 NDK 版本"; exit 1; }
 
-         SHORT="r${VER%%.*}"
+          SHORT="r${VER%%.*}"
           FILE="android-ndk-${SHORT}-linux.zip"
           URL="https://dl.google.com/android/repository/${FILE}"
 
@@ -49,7 +48,6 @@ jobs:
 
           echo "latest: ${VER} (${SHORT}) -> ${URL}"
 
-      # ---------- 2. 已是最新版就跳过下载 ----------
       - name: Check if already up to date
         id: check
         shell: bash
@@ -62,7 +60,6 @@ jobs:
             echo "skip=false" >> "$GITHUB_OUTPUT"
           fi
 
-      # ---------- 3. 下载 zip 到仓库根目录 ----------
       - name: Download NDK zip
         if: steps.check.outputs.skip != 'true'
         shell: bash
@@ -72,7 +69,6 @@ jobs:
             -o "${{ steps.detect.outputs.file }}" \
             "${{ steps.detect.outputs.url }}"
 
-      # ---------- 4. 校验完整性 + 记录版本信息 ----------
       - name: Verify and record
         if: steps.check.outputs.skip != 'true'
         shell: bash
@@ -82,17 +78,18 @@ jobs:
 
           unzip -tq "$FILE" >/dev/null || { echo "::error::zip 损坏"; exit 1; }
 
-          echo "sha256: $(sha256sum "$FILE" | awk '{print $1}')"
+          SUM="$(sha256sum "$FILE" | awk '{print $1}')"
+          echo "sha256: ${SUM}"
+
           {
             echo "ndk_version=${{ steps.detect.outputs.version }}"
             echo "ndk_short=${{ steps.detect.outputs.short }}"
             echo "file=${FILE}"
             echo "source_url=${{ steps.detect.outputs.url }}"
-            echo "sha256=$(sha256sum "$FILE" | awk '{print $1}')"
+            echo "sha256=${SUM}"
             echo "updated_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           } > "${FILE%.zip}.info"
 
-      # ---------- 5. 提交到仓库根目录 ----------
       - name: Commit to repo root
         if: steps.check.outputs.skip != 'true'
         shell: bash
