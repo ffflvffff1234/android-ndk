@@ -4,7 +4,7 @@ on:
   push:
     branches: [main]
     paths:
-      - '.github/workflows/fndk.yml'   # 改配置才触发，避免自己永久循环
+      - '.github/workflows/fech-ndk.yml'   # 改配置才触发，避免自己永久循环
       - 'LOCK'
   schedule:
     - cron: '0 2 * * 1'                # 锁存在后：每周一北京时间 10:00 巡检
