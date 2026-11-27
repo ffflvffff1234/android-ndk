@@ -1,0 +1,127 @@
+name: Fetch Latest Android NDK
+
+on:
+  schedule:
+    - cron: '0 2 * * 1'      # 每周一北京时间 10:00
+  workflow_dispatch:          # 手动触发
+
+permissions:
+  contents: write             # 建 Release / 传附件需要
+
+jobs:
+  fetch-ndk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # ---------- 1. 从官方清单探测最新 stable 版 ----------
+      - name: Detect latest NDK
+        id: detect
+        shell: bash
+        run: |
+          set -euo pipefail
+          XML="$(curl -fsSL https://dl.google.com/android/repository/repository2-3.xml)"
+
+          VER="$(printf '%s' "$XML" \
+            | grep -oE '<remotePackage path="ndk;[^"]+"' \
+            | grep -oE '[0-9]+\.[0-9]+\.[0-9]+(-rc[0-9]+)?(-beta[0-9]+)?' \
+            | grep -vE -- '-(rc|beta)[0-9]+$' \
+            | sort -t. -k1,1n -k2,2n -k3,3n \
+            | tail -n1)"
+
+          [ -n "$VER" ] || { echo "::error::未能解析最新 NDK 版本"; exit 1; }
+
+          SHORT="r${VER%%.*}"
+          FILE="android-ndk-${SHORT}-linux.zip"
+          URL="https://dl.google.com/android/repository/${FILE}"
+          TAG="ndk-${SHORT}"
+
+          curl -fI --silent "$URL" >/dev/null \
+            || { echo "::error::${URL} 不可访问，包名规律可能已变化"; exit 1; }
+
+          {
+            echo "version=${VER}"
+            echo "short=${SHORT}"
+            echo "file=${FILE}"
+            echo "url=${URL}"
+            echo "tag=${TAG}"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "latest: ${VER} (${SHORT}) -> ${URL}"
+
+      # ---------- 2. 已有对应 Release 就跳过 ----------
+      - name: Check existing Release
+        id: check
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if gh release view "${{ steps.detect.outputs.tag }}" >/dev/null 2>&1; then
+            echo "Release ${{ steps.detect.outputs.tag }} 已存在，无需更新"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # ---------- 3. 下载 zip（不解压） ----------
+      - name: Download NDK zip
+        if: steps.check.outputs.skip != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fL --retry 3 --retry-delay 5 --progress-bar \
+            -o "${{ steps.detect.outputs.file }}" \
+            "${{ steps.detect.outputs.url }}"
+
+      # ---------- 4. 校验完整性 + 写版本信息 ----------
+      - name: Verify and record
+        if: steps.check.outputs.skip != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          FILE="${{ steps.detect.outputs.file }}"
+
+          unzip -tq "$FILE" >/dev/null || { echo "::error::zip 损坏"; exit 1; }
+
+          SUM="$(sha256sum "$FILE" | awk '{print $1}')"
+          SIZE="$(du -h "$FILE" | awk '{print $1}')"
+          echo "sha256: ${SUM}  size: ${SIZE}"
+
+          {
+            echo "ndk_version=${{ steps.detect.outputs.version }}"
+            echo "ndk_short=${{ steps.detect.outputs.short }}"
+            echo "file=${FILE}"
+            echo "source_url=${{ steps.detect.outputs.url }}"
+            echo "sha256=${SUM}"
+            echo "size=${SIZE}"
+            echo "updated_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          } > "${FILE%.zip}.info"
+
+      # ---------- 5. 发布到 Release（不进 Git 历史） ----------
+      - name: Publish to Release
+        if: steps.check.outputs.skip != 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          FILE="${{ steps.detect.outputs.file }}"
+          TAG="${{ steps.detect.outputs.tag }}"
+
+          gh release view "$TAG" >/dev/null 2>&1 \
+            || gh release create "$TAG" \
+                 --title "Android NDK ${{ steps.detect.outputs.version }}" \
+                 --notes "Auto-synced from dl.google.com (linux x86_64, 未解压)
+
+          - 版本: ${{ steps.detect.outputs.version }}
+          - 来源: ${{ steps.detect.outputs.url }}
+          - SHA256: 见 \`${FILE%.zip}.info\`
+
+          用 \`unzip -q "$FILE" -d \$ANDROID_NDK_HOME\` 解压即可。"
+
+          gh release upload "$TAG" "$FILE" "${FILE%.zip}.info" --clobber
+
+          echo "done: https://github.com/${{ github.repository }}/releases/tag/${TAG}"
