@@ -1,0 +1,150 @@
+name: Mirror Legacy NDK
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/fonr.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Mirror all legacy NDK releases
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -uo pipefail
+          BASE="https://dl.google.com/android/repository"
+
+          # ===== 写死的版本清单：r30 之前，老 -> 新 =====
+          VERS="
+          r4 r5 r5b r5c r6 r6b r7 r7b r7c r7d
+          r8 r8b r8c r8d r8e r8f
+          r9 r9b r9c r9d r9e
+          r10 r10b r10c r10d r10e
+          r11 r11b r11c
+          r12 r12b
+          r13 r13b
+          r14 r14b
+          r15 r15b r15c
+          r16 r16b
+          r17 r17b r17c
+          r18 r18b
+          r19 r19b r19c
+          r20 r20b
+          r21 r21b r21c r21d r21e
+          r22 r22b
+          r23 r23b r23c
+          r24
+          r25 r25b r25c
+          r26
+          r27 r27b r27c r27d
+          r28 r28b r28c
+          r29
+          "
+
+          mkdir -p dist
+          TOTAL=0; REL=0; SKIP=0; FAIL=0
+
+          for V in $VERS; do
+            TOTAL=$((TOTAL+1))
+            TAG="ndk-$V"
+            D="dist/$V"
+            rm -rf "$D"; mkdir -p "$D"
+            GOT=""
+
+            MAJOR=0
+            if [[ "$V" =~ ^r([0-9]+) ]]; then MAJOR="${BASH_REMATCH[1]}"; fi
+
+            for P in linux windows mac; do
+              case "$P" in
+                linux)
+                  CAND="android-ndk-$V-linux-x86_64.zip android-ndk-$V-linux.zip android-ndk-$V-linux-x86.zip"
+                  ;;
+                windows)
+                  CAND="android-ndk-$V-windows-x86_64.zip android-ndk-$V-windows.zip android-ndk-$V-windows-x86.zip"
+                  ;;
+                mac)
+                  # r11 起官方改用 dmg；r11 之前只发 zip
+                  if [ "$MAJOR" -ge 11 ]; then
+                    CAND="android-ndk-$V-darwin.dmg android-ndk-$V-darwin-x86_64.dmg android-ndk-$V-darwin-x86_64.zip android-ndk-$V-darwin.zip android-ndk-$V-mac-x86_64.zip android-ndk-$V-mac.zip"
+                  else
+                    CAND="android-ndk-$V-darwin-x86.zip android-ndk-$V-darwin.zip android-ndk-$V-mac-x86.zip android-ndk-$V-macosx.zip android-ndk-$V-mac.zip"
+                  fi
+                  ;;
+              esac
+
+              for C in $CAND; do
+                F="$D/$C"
+                if curl -fsSL --retry 2 --retry-delay 3 --connect-timeout 20 \
+                        --max-time 1500 -o "$F" "$BASE/$C"; then
+                  FX="${C##*.}"
+                  BAD=0
+                  case "$FX" in
+                    zip) unzip -tq "$F" >/dev/null 2>&1 || BAD=1 ;;
+                    dmg) [ -s "$F" ] || BAD=1 ;;
+                    *)   BAD=1 ;;
+                  esac
+                  if [ "$BAD" -eq 0 ]; then
+                    GOT="$GOT $C"
+                    echo "  [ok] $V $P -> $C"
+                    break
+                  fi
+                fi
+                rm -f "$F"
+              done
+            done
+
+            if [ -z "$GOT" ]; then
+              echo "::notice::[skip] $V 官方无预编译包"
+              SKIP=$((SKIP+1))
+              rm -rf "$D"
+              continue
+            fi
+
+            # 只给包文件算校验和，NOTES 放在目录外，避免被当附件或自引用
+            ( cd "$D" && ls -1 | grep -v '^SHA256SUMS.txt$' | xargs -r sha256sum > SHA256SUMS.txt )
+            NOTES="dist/notes-$V.md"
+            {
+              echo "Android NDK $V"
+              echo
+              echo "原样来自 dl.google.com/android/repository，未做修改。"
+              echo "每个平台包内含该版本支持的全部架构工具链。"
+              echo
+              cat "$D/SHA256SUMS.txt"
+            } > "$NOTES"
+
+            if gh release view "$TAG" >/dev/null 2>&1; then
+              gh release upload "$TAG" "$D"/* --clobber >/dev/null 2>&1 \
+                && echo "::notice::[update] $TAG" \
+                || { echo "::warning::[update-failed] $TAG"; FAIL=$((FAIL+1)); }
+            elif gh release create "$TAG" "$D"/* \
+                   --title "Android NDK $V" \
+                   --notes-file "$NOTES"; then
+              REL=$((REL+1))
+              echo "::notice::[release] $TAG"
+            else
+              echo "::error::[release-failed] $TAG"
+              FAIL=$((FAIL+1))
+            fi
+
+            # 发完立刻删，防止几十 GB 撑爆 runner 磁盘
+            rm -rf "$D" "$NOTES"
+            # 拉开真实发布时间戳，保证 Release 页越老越靠下
+            sleep 30
+          done
+
+          echo "######## 完成 ########"
+          echo "检查 $TOTAL 个版本，新建发布 $REL 个，跳过 $SKIP 个，失败 $FAIL 个"
+          gh release list --limit 100
+          [ "$FAIL" -eq 0 ] || exit 1
